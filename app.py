@@ -132,8 +132,11 @@ def create_app() -> Flask:
     return app
 
 
+app = create_app()
+application = app
+
+
 if __name__ == "__main__":
     # When run directly, create the app and run the development server.  The
     # host is set to 0.0.0.0 to allow access via Docker or remote hosts.
-    application = create_app()
-    application.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
