@@ -19,14 +19,38 @@ installed, the app will still run but will not annotate images.
 import os
 from flask import Flask, request, render_template, url_for
 
-import numpy as np
-import cv2
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None  # type: ignore
 
 try:
     import torch  # type: ignore
 except ImportError:
     # PyTorch is optional; the app can still run without performing inference
     torch = None  # type: ignore
+
+
+def get_inference_unavailable_reason() -> str | None:
+    """Explain why inference is unavailable in the current environment."""
+    if torch is None:
+        return "PyTorch is not installed in this deployment environment."
+    if np is None or cv2 is None:
+        return "Image processing dependencies are not installed in this deployment environment."
+
+    weights_path = os.environ.get(
+        "MODEL_WEIGHTS",
+        os.path.join(os.path.dirname(__file__), "weights", "best.pt"),
+    )
+    if not os.path.isfile(weights_path):
+        return f"Model weights were not found at {weights_path}."
+
+    return None
 
 
 def load_model() -> "torch.nn.Module | None":
@@ -40,16 +64,16 @@ def load_model() -> "torch.nn.Module | None":
     ``trust_repo=True`` (available from PyTorch 1.13 onward) prevents
     warnings about untrusted repositories.
     """
-    if torch is None:
-        print("PyTorch not installed; model loading skipped.")
+    unavailable_reason = get_inference_unavailable_reason()
+    if unavailable_reason is not None:
+        print(f"Model loading skipped. {unavailable_reason}")
         return None
+
     weights_path = os.environ.get(
         "MODEL_WEIGHTS",
         os.path.join(os.path.dirname(__file__), "weights", "best.pt"),
     )
-    if not os.path.isfile(weights_path):
-        print(f"Weights file not found at {weights_path}; model loading skipped.")
-        return None
+
     try:
         # The 'custom' argument tells YOLOv5 to load a user‑trained model
         model = torch.hub.load(
@@ -96,6 +120,16 @@ def create_app() -> Flask:
         if not upload or upload.filename == "":
             return render_template(
                 "index.html", error="Please select an image to upload."
+            )
+
+        unavailable_reason = get_inference_unavailable_reason()
+        if model is None:
+            return render_template(
+                "index.html",
+                error=(
+                    "Helmet detection is unavailable in this deployment. "
+                    f"{unavailable_reason or 'The model could not be loaded.'}"
+                ),
             )
 
         # Read the uploaded image into a NumPy array

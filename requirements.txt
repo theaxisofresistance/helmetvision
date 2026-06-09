@@ -1,5 +1,1 @@
 Flask>=2.2
-numpy
-opencv-python
-torch
-ultralytics>=8.0  # needed for YOLOv8/YOLOv5 integration
