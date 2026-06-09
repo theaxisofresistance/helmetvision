@@ -17,6 +17,7 @@ installed, the app will still run but will not annotate images.
 """
 
 import os
+import tempfile
 from flask import Flask, request, render_template, url_for
 
 try:
@@ -87,15 +88,16 @@ def load_model() -> "torch.nn.Module | None":
         return None
 
 
+def get_results_dir() -> str:
+    """Return a writable directory for generated outputs."""
+    results_dir = os.path.join(tempfile.gettempdir(), "helmet_detection_results")
+    os.makedirs(results_dir, exist_ok=True)
+    return results_dir
+
+
 def create_app() -> Flask:
     """Factory function to create and configure the Flask application."""
     app = Flask(__name__)
-
-    # Directory where annotated images will be saved.  Using ``app.root_path``
-    # ensures that the directory resides alongside this module regardless of
-    # the current working directory.
-    results_dir = os.path.join(app.root_path, "static", "results")
-    os.makedirs(results_dir, exist_ok=True)
 
     # Load the model once when the app starts.  If loading fails the variable
     # will be ``None`` and prediction will be skipped.
@@ -143,6 +145,7 @@ def create_app() -> Flask:
 
         annotated_path = None
         if model is not None:
+            results_dir = get_results_dir()
             # Perform inference; results.render() returns a list of annotated
             # images corresponding to the input batch.  Here we upload a
             # single image, so take the first result.
