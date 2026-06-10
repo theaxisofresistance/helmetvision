@@ -17,8 +17,11 @@ installed, the app will still run but will not annotate images.
 """
 
 import os
+import pickle
 import tempfile
-from flask import Flask, request, render_template, url_for
+from functools import lru_cache
+from flask import Flask, jsonify, request, render_template, url_for
+from werkzeug.utils import secure_filename
 
 try:
     import numpy as np
@@ -35,6 +38,161 @@ try:
 except ImportError:
     # PyTorch is optional; the app can still run without performing inference
     torch = None  # type: ignore
+
+
+IMG_SIZE_ENV = os.environ.get("IMG_SIZE", "128,128")
+IMG_SIZE = tuple(int(part.strip()) for part in IMG_SIZE_ENV.split(",", 1))
+FEATURE_SIZE_ENV = os.environ.get("FEATURE_IMAGE_SIZE", "262,496")
+FEATURE_IMAGE_SIZE = tuple(int(part.strip()) for part in FEATURE_SIZE_ENV.split(",", 1))
+FEATURE_COLOR_MODE = os.environ.get("FEATURE_COLOR_MODE", "grayscale").lower()
+USE_PCA = True
+MODEL_BUNDLE_PATH = os.environ.get("MODEL_BUNDLE_PATH", "models.pkl")
+SCALER_PATH = os.environ.get("SCALER_PATH", "scaler.pkl")
+PCA_PATH = os.environ.get("PCA_PATH", "pca.pkl")
+LABEL_ENCODER_PATH = os.environ.get("LABEL_ENCODER_PATH", "encoder.pkl")
+
+
+def load_pickle_file(path: str):
+    """Load a pickled artifact from disk."""
+    with open(path, "rb") as artifact_file:
+        return pickle.load(artifact_file)
+
+
+@lru_cache(maxsize=1)
+def load_models(model_path: str = MODEL_BUNDLE_PATH):
+    """Load the bundled sklearn models."""
+    return load_pickle_file(model_path)
+
+
+@lru_cache(maxsize=1)
+def load_scaler(path: str = SCALER_PATH):
+    """Load the fitted feature scaler."""
+    return load_pickle_file(path)
+
+
+@lru_cache(maxsize=1)
+def load_pca(path: str = PCA_PATH):
+    """Load the fitted PCA transformer."""
+    return load_pickle_file(path)
+
+
+@lru_cache(maxsize=1)
+def load_label_encoder(path: str = LABEL_ENCODER_PATH):
+    """Load the label encoder used during training."""
+    return load_pickle_file(path)
+
+
+def describe_pickle_loading_error(exc: Exception) -> str:
+    """Convert artifact loading failures into a readable readiness message."""
+    if isinstance(exc, ModuleNotFoundError):
+        return f"Missing Python dependency required by pickled artifacts: {exc.name}."
+    return f"Could not load pickled ML artifacts: {exc}"
+
+
+def extract_features(img):
+    """Convert an image into the same flattened feature shape used in training."""
+    resized = cv2.resize(img, (FEATURE_IMAGE_SIZE[1], FEATURE_IMAGE_SIZE[0]))
+
+    if FEATURE_COLOR_MODE == "grayscale":
+        resized = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    elif FEATURE_COLOR_MODE != "rgb":
+        raise ValueError(
+            "Unsupported FEATURE_COLOR_MODE. Use 'rgb' or 'grayscale'."
+        )
+
+    return resized.reshape(-1)
+
+
+def get_expected_feature_count() -> int | None:
+    """Read the expected feature count from the fitted scaler when available."""
+    try:
+        scaler = load_scaler()
+    except Exception:
+        return None
+
+    return getattr(scaler, "n_features_in_", None)
+
+
+def get_pickle_inference_unavailable_reason() -> str | None:
+    """Explain why the sklearn pickle inference API cannot run."""
+    if np is None or cv2 is None:
+        return "NumPy or OpenCV is not installed in this environment."
+    if not os.path.isfile(MODEL_BUNDLE_PATH):
+        return f"Model bundle not found at {MODEL_BUNDLE_PATH}."
+    if not os.path.isfile(SCALER_PATH):
+        return f"Scaler not found at {SCALER_PATH}."
+    if not os.path.isfile(LABEL_ENCODER_PATH):
+        return f"Label encoder not found at {LABEL_ENCODER_PATH}."
+    if USE_PCA and not os.path.isfile(PCA_PATH):
+        return f"PCA artifact not found at {PCA_PATH}."
+
+    try:
+        load_models()
+        load_scaler()
+        load_label_encoder()
+        if USE_PCA:
+            load_pca()
+    except Exception as exc:
+        return describe_pickle_loading_error(exc)
+
+    return None
+
+
+def infer_image(filepath, model_name="KNN", model_path=MODEL_BUNDLE_PATH):
+    """Run inference for one image using a selected sklearn model."""
+    unavailable_reason = get_pickle_inference_unavailable_reason()
+    if unavailable_reason is not None:
+        raise RuntimeError(unavailable_reason)
+
+    models_dict = load_models(model_path)
+
+    if model_name not in models_dict:
+        raise ValueError(
+            f"Model '{model_name}' not found. Available: {list(models_dict.keys())}"
+        )
+
+    img = cv2.imread(filepath)
+    if img is None:
+        raise FileNotFoundError(f"Could not read image: {filepath}")
+
+    feat = extract_features(img).astype(np.float32).reshape(1, -1)
+
+    scaler = load_scaler()
+    expected_feature_count = getattr(scaler, "n_features_in_", None)
+    actual_feature_count = feat.shape[1]
+    if (
+        expected_feature_count is not None
+        and actual_feature_count != expected_feature_count
+    ):
+        raise ValueError(
+            "Feature mismatch between inference and training pipeline. "
+            f"Extractor produced {actual_feature_count} features, "
+            f"but scaler expects {expected_feature_count}. "
+            f"Current FEATURE_IMAGE_SIZE={FEATURE_IMAGE_SIZE} and "
+            f"FEATURE_COLOR_MODE='{FEATURE_COLOR_MODE}'."
+        )
+
+    feat = scaler.transform(feat)
+
+    if USE_PCA:
+        pca = load_pca()
+        feat = pca.transform(feat)
+
+    le = load_label_encoder()
+    model = models_dict[model_name]
+    pred_idx = model.predict(feat)[0]
+    pred_label = le.inverse_transform([pred_idx])[0]
+
+    prob = None
+    if hasattr(model, "predict_proba"):
+        prob = model.predict_proba(feat)[0].tolist()
+
+    return {
+        "model": model_name,
+        "prediction": pred_label,
+        "prediction_index": int(pred_idx),
+        "probabilities": prob,
+    }
 
 
 def get_inference_unavailable_reason() -> str | None:
@@ -107,6 +265,63 @@ def create_app() -> Flask:
     def index() -> str:
         """Render the upload form.  Displays the last result if available."""
         return render_template("index.html")
+
+    @app.route("/api/health")
+    def api_health():
+        """Return basic API health and artifact readiness."""
+        pickle_reason = get_pickle_inference_unavailable_reason()
+        available_models = []
+        if pickle_reason is None:
+            try:
+                available_models = list(load_models().keys())
+            except Exception as exc:
+                pickle_reason = describe_pickle_loading_error(exc)
+
+        return jsonify(
+            {
+                "status": "ok",
+                "pickle_inference_ready": pickle_reason is None,
+                "pickle_inference_error": pickle_reason,
+                "expected_feature_count": get_expected_feature_count(),
+                "feature_image_size": FEATURE_IMAGE_SIZE,
+                "feature_color_mode": FEATURE_COLOR_MODE,
+                "available_models": available_models,
+            }
+        )
+
+    @app.route("/api/infer", methods=["POST"])
+    def api_infer():
+        """Run sklearn pickle inference for an uploaded image."""
+        upload = request.files.get("file")
+        model_name = request.form.get("model_name", "KNN")
+
+        if not upload or upload.filename == "":
+            return jsonify({"error": "Please upload an image file with field name 'file'."}), 400
+
+        unavailable_reason = get_pickle_inference_unavailable_reason()
+        if unavailable_reason is not None:
+            return jsonify({"error": unavailable_reason}), 503
+
+        temp_path = None
+        try:
+            suffix = os.path.splitext(secure_filename(upload.filename) or "upload.jpg")[1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".jpg") as temp_file:
+                upload.save(temp_file)
+                temp_path = temp_file.name
+
+            result = infer_image(temp_path, model_name=model_name)
+            return jsonify(result)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 503
+        except Exception as exc:
+            return jsonify({"error": f"Inference failed: {exc}"}), 500
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
 
     @app.route("/predict", methods=["POST"])
     def predict():
